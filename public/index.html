@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f172a" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E🎙️%3C/text%3E%3C/svg%3E" />
+  <title>Play It – Japanese Transcription</title>
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Play It</h1>
+    <button id="newBtn" class="link-btn" hidden>New file</button>
+  </header>
+
+  <main>
+    <!-- Upload view -->
+    <section id="uploadView" class="card">
+      <label for="fileInput" class="dropzone" id="dropzone">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a4 4 0 0 0-4 4v5a4 4 0 0 0 8 0V7a4 4 0 0 0-4-4Zm-7 9a1 1 0 1 1 2 0 5 5 0 0 0 10 0 1 1 0 1 1 2 0 7 7 0 0 1-6 6.93V21h3a1 1 0 1 1 0 2H8a1 1 0 1 1 0-2h3v-2.07A7 7 0 0 1 5 12Z"/></svg>
+        <span class="dz-title">Choose an audio file</span>
+        <span class="dz-sub" id="dzSub">MP3 · WAV · M4A · OGG · FLAC… · Japanese speech</span>
+      </label>
+      <input id="fileInput" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.mp4,.ogg,.oga,.opus,.flac,.webm" hidden />
+      <div id="fileInfo" class="file-info" hidden></div>
+      <fieldset class="engine" id="enginePicker">
+        <legend>Transcribe on</legend>
+        <label class="engine-opt">
+          <input type="radio" name="engine" value="device" />
+          <span><b>This phone</b><small id="deviceNote">Private, works offline after the first download</small></span>
+        </label>
+        <div id="deviceModels" class="model-opts"></div>
+        <label class="engine-opt">
+          <input type="radio" name="engine" value="server" />
+          <span><b>Computer</b><small id="serverNote">Checking…</small></span>
+        </label>
+      </fieldset>
+      <button id="transcribeBtn" class="primary" disabled>Transcribe</button>
+      <p id="error" class="error" role="alert" hidden></p>
+    </section>
+
+    <!-- Previously transcribed files -->
+    <section id="recentView" class="recent" hidden>
+      <h2 class="recent-head">Recent <span id="recentSize" class="muted small"></span></h2>
+      <ul id="recentList" class="recent-list"></ul>
+    </section>
+
+    <!-- Loading / progress -->
+    <section id="loadingView" class="card" hidden>
+      <div class="progress-head">
+        <div class="spinner small-spin" aria-hidden="true"></div>
+        <div>
+          <p id="phaseText" class="phase">Uploading…</p>
+          <p id="phaseSub" class="muted small"></p>
+        </div>
+      </div>
+      <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"><div id="barFill" class="bar-fill"></div></div>
+      <ol id="preview" class="preview" lang="ja" aria-live="polite"></ol>
+    </section>
+
+    <!-- Transcript -->
+    <section id="resultView" hidden>
+      <div class="track">
+        <img id="cover" class="cover" alt="" hidden />
+        <div class="track-text">
+          <p id="trackTitle" class="track-title"></p>
+          <p id="trackArtist" class="track-line" hidden></p>
+          <p id="trackAlbum" class="track-line muted" hidden></p>
+        </div>
+      </div>
+      <div class="result-head">
+        <p id="hint" class="muted small hint">Tap a sentence to play from there.</p>
+        <div class="result-actions">
+          <label class="switch">
+            <input id="textToggle" type="checkbox" />
+            <span class="switch-track" aria-hidden="true"></span>
+            <span>Text</span>
+          </label>
+          <label class="switch" id="furiSwitch">
+            <input id="furiToggle" type="checkbox" checked />
+            <span class="switch-track" aria-hidden="true"></span>
+            <span>Furigana</span>
+          </label>
+          <button id="copyBtn" class="link-btn">Copy</button>
+        </div>
+      </div>
+      <ol id="transcript" class="transcript" lang="ja"></ol>
+    </section>
+  </main>
+
+  <!-- Player docked at bottom -->
+  <footer id="player" class="player" hidden>
+    <audio id="audio" preload="metadata"></audio>
+    <div class="seek-row">
+      <span id="curTime" class="time">0:00</span>
+      <input id="seek" type="range" min="0" max="0" step="0.01" value="0" aria-label="Seek" />
+      <span id="durTime" class="time">0:00</span>
+    </div>
+    <div class="controls">
+      <button id="rateBtn" class="rate-btn" aria-label="Playback speed" title="Playback speed">1×</button>
+      <button id="prevBtn" class="icon-btn" aria-label="Previous sentence" title="Previous sentence">
+        <svg viewBox="0 0 24 24"><path d="M6 5h2v14H6zm3.5 7L19 5v14z"/></svg>
+      </button>
+      <button id="playBtn" class="play-btn" aria-label="Play">
+        <svg id="playIcon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+        <svg id="pauseIcon" viewBox="0 0 24 24" hidden><path d="M6 5h4v14H6zm8 0h4v14h-4z"/></svg>
+      </button>
+      <button id="nextBtn" class="icon-btn" aria-label="Next sentence" title="Next sentence">
+        <svg viewBox="0 0 24 24"><path d="M16 5h2v14h-2zM5 5l9.5 7L5 19z"/></svg>
+      </button>
+      <button id="repeatBtn" class="icon-btn toggle" aria-label="Repeat current sentence" aria-pressed="false" title="Repeat sentence">
+        <svg viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/><text x="12" y="14.6" text-anchor="middle" font-size="7" font-weight="700">1</text></svg>
+      </button>
+    </div>
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

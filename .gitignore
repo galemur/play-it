@@ -1,0 +1,12 @@
+node_modules/
+.env
+models/
+dist/
+.claude/
+
+# Test recordings, screenshots and build archives
+*.mp3
+*.wav
+*.m4a
+*.jpg
+*.zip
