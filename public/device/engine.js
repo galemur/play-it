@@ -3,6 +3,25 @@ import { SAMPLE_RATE } from '../shared/chunking.js';
 
 export { DEVICE_MODELS, modelTag } from './models.js';
 
+// A model whose GPU run failed is run on the CPU from then on, until Chrome updates
+// (a new Chrome often brings GPU driver workarounds), or the user retries the GPU.
+const GPU_FAIL_PREFIX = 'playit:gpu-failed:';
+const browserVersion = () => navigator.userAgent.match(/Chrome\/([\d.]+)/)?.[1] ?? navigator.userAgent;
+
+/** Details of a GPU failure for this model on this browser version, or null. */
+export function getGpuFailure(modelKey) {
+  try {
+    const f = JSON.parse(localStorage.getItem(GPU_FAIL_PREFIX + modelKey));
+    return f?.browser === browserVersion() ? f : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearGpuFailure(modelKey) {
+  localStorage.removeItem(GPU_FAIL_PREFIX + modelKey);
+}
+
 // The whole recording is held in memory as 16 kHz floats (~230 MB per hour).
 const MAX_DURATION_SEC = 3 * 60 * 60;
 
@@ -77,21 +96,22 @@ export function encodeWav(samples, name) {
 let worker;
 let busy = false;
 
-/**
- * Transcribe a File on this device.
- * @param {(update: object) => void} onUpdate receives job-like {phase, progress, segments, duration}
- */
-export async function transcribeOnDevice(file, modelKey, onUpdate) {
+/** Run one job on the long-lived worker, forwarding progress updates. */
+async function runJob(message, transfer, onUpdate) {
   if (busy) throw new Error('Another transcription is already running.');
   busy = true;
   try {
-    onUpdate({ phase: 'decoding' });
-    const audio = await decodeFile(file);
     worker ??= new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
     return await new Promise((resolve, reject) => {
       worker.onmessage = ({ data }) => {
         if (data.type === 'update') onUpdate(data);
-        else if (data.type === 'done') resolve(data.result);
+        else if (data.type === 'gpu-failed') {
+          console.warn('WebGPU failed, falling back to CPU:', data.message, data.gpu);
+          localStorage.setItem(
+            GPU_FAIL_PREFIX + data.model,
+            JSON.stringify({ browser: browserVersion(), message: data.message, gpu: data.gpu, at: new Date().toISOString() })
+          );
+        } else if (data.type === 'done') resolve(data.result);
         else if (data.type === 'error') reject(new Error(data.message));
       };
       worker.onerror = (e) => {
@@ -100,9 +120,34 @@ export async function transcribeOnDevice(file, modelKey, onUpdate) {
         worker = null;
         reject(new Error(e.message || 'The transcription worker crashed (the device may be out of memory).'));
       };
-      worker.postMessage({ type: 'transcribe', audio, model: modelKey }, [audio.buffer]);
+      worker.postMessage(message, transfer);
     });
   } finally {
     busy = false;
   }
+}
+
+/**
+ * Transcribe a File on this device. With `transcript` (the user's own text), the result is
+ * that text timed against the audio instead of Whisper's wording.
+ * @param {(update: object) => void} onUpdate receives job-like {phase, progress, segments, duration}
+ */
+export async function transcribeOnDevice(file, modelKey, onUpdate, { simulateGpuError = false, transcript = null } = {}) {
+  onUpdate({ phase: 'decoding' });
+  const audio = await decodeFile(file);
+  const options = { allowGPU: !getGpuFailure(modelKey), simulateGpuError, transcript };
+  return runJob({ type: 'transcribe', audio, model: modelKey, options }, [audio.buffer], onUpdate);
+}
+
+/** Time the user's transcript using an existing Whisper result (from the server or history). */
+export async function alignOnDevice(file, asr, transcript, duration, onUpdate) {
+  onUpdate({ phase: 'decoding' });
+  const audio = await decodeFile(file);
+  return runJob({ type: 'align', audio, asr, transcript, duration: duration || audio.length / SAMPLE_RATE }, [audio.buffer], onUpdate);
+}
+
+/** Add furigana to already-timed segments (e.g. from an imported .lrc file). */
+export async function furiganaOnDevice(segments, onUpdate) {
+  onUpdate({ phase: 'furigana' });
+  return (await runJob({ type: 'furigana', segments }, [], onUpdate)).segments;
 }

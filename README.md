@@ -138,6 +138,59 @@ the download percentage if you upload a file before it finishes.
   is full, only the transcript is kept, and tapping the entry asks for the file again.
   Choosing a file that's already in the list also opens the saved transcript.
 
+## Your own transcript (timing a text you already have)
+
+If you already have the text of a recording (a textbook script, lyrics, a dialogue),
+tap **Add your own transcript** and choose a `.txt` file. Put one sentence per line,
+or separate sentences with 。！？. UTF-8, UTF-16 and Shift_JIS files all work.
+
+Whisper still transcribes the audio, but only to find **when** each of your
+sentences is spoken. The transcript you see is your text, with your sentence
+breaks, punctuation and spelling, plus furigana. Play-along, sentence skipping,
+repeat and the pause between repeats all work as usual.
+
+How the timing works (`public/shared/align.js`):
+
+1. Both texts are converted to hiragana readings with kuromoji. Writing differences
+   such as 1週間 vs 一週間, or kanji vs kana, then don't prevent a match.
+2. Unique 4-character runs anchor the two texts to each other, and an edit-distance
+   match fills in between the anchors. This works on long recordings even when
+   Whisper mishears or skips parts.
+3. Each sentence gets its start and end from its matched characters. Then the
+   boundaries are tightened to where speech actually starts and stops in the audio.
+   This is skipped when there's no clear pause, e.g. music under the voice.
+4. Sentences that couldn't be matched (not in the audio, or badly misheard) get an
+   estimated time between their neighbours and are marked **≈**.
+
+Measured on 15 JSUT sentences against the true speech boundaries: median error
+**0.10 s**, worst **0.22 s**. A sentence missing from the audio is flagged ≈. If the
+same recording was transcribed before, its saved transcription is reused, so timing a
+new or edited transcript takes under a second. In "Computer" mode, the server
+transcribes and the browser does the timing.
+
+## Import and export .lrc (synced lyrics)
+
+**Export:** tap **Export** on the result screen to save the transcript as `<audio name>.lrc`.
+On a phone this opens Android's share sheet (save to Files, or send to another app);
+elsewhere it downloads. The file has the same base name as the audio, so many music
+players show the lyrics automatically.
+
+LRC only stores when each line starts. To keep sentence ends, which repeat mode
+uses, the export adds a blank timed line where a sentence ends before a pause.
+This is a common LRC convention, and importing reads it back.
+
+**Import:** choose a `.lrc` file under **Add transcript or lyrics**, then pick one of:
+
+- **Use the timings in the file** (the default): instant, no transcription. Only
+  furigana are added, so this works without any speech model.
+- **Re-time to this audio:** the lines are matched to the speech, as with a .txt
+  transcript. Use this for downloaded lyrics whose timings are rough or offset.
+
+The importer handles `[ti:]` / `[ar:]` / `[al:]` (used when the audio has no tags of
+its own), `[offset:]`, several timestamps on one line (repeated choruses), and
+per-word `<mm:ss.xx>` timestamps, which are ignored. A `.lrc` file without
+timestamps is treated as plain text and timed to the audio.
+
 ## Furigana
 
 Furigana are generated on the server with
@@ -157,6 +210,8 @@ transcribers/local.js   Offline Whisper (Transformers.js)
 transcribers/openai.js  Cloud Whisper (OpenAI-compatible API)
 lib/audio.js            MP3/WAV decoding to 16 kHz mono, silence-based chunking
 lib/furigana.js         Kanji readings (kuromoji) aligned for ruby display
+public/shared/align.js  Times a user transcript against Whisper's segments and the audio
+public/shared/lrc.js    .lrc (synced lyrics) parsing and export
 public/                 Mobile-first frontend (no build step)
   metadata.js           ID3 tag reader (title, artist, album, cover)
   history.js            Recent files: transcripts + audio in IndexedDB
