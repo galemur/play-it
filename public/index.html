@@ -26,6 +26,31 @@
       </label>
       <input id="fileInput" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.mp4,.ogg,.oga,.opus,.flac,.webm" hidden />
       <div id="fileInfo" class="file-info" hidden></div>
+      <div class="transcript-pick">
+        <button type="button" id="textPickBtn" class="pick-btn">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2h8l6 6v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Zm7 1.5V9h5.5L13 3.5ZM8 13v2h8v-2H8Zm0 4v2h5v-2H8Z"/></svg>
+          <span><b>Add transcript or lyrics</b><small>Optional · .txt text, or .lrc with timings</small></span>
+        </button>
+        <input id="textInput" type="file" accept=".txt,.lrc,text/*" hidden />
+        <div id="textInfo" class="file-info text-info" hidden>
+          <span id="textInfoText"></span>
+          <button type="button" id="textRemove" class="link-btn">Remove</button>
+        </div>
+        <div id="lrcModes" class="lrc-modes" role="radiogroup" aria-label="How to use the .lrc file" hidden>
+          <label class="model-opt">
+            <input type="radio" name="lrcMode" value="file" checked />
+            <span><b>Use the timings in the file</b><small>Instant · no transcription needed</small></span>
+          </label>
+          <label class="model-opt">
+            <input type="radio" name="lrcMode" value="retime" />
+            <span><b>Re-time to this audio</b><small>Transcribes to match each line to the speech · for rough timings</small></span>
+          </label>
+        </div>
+        <p id="textHelp" class="muted small text-help" hidden>
+          Your sentences will be shown instead of the automatic transcription, each timed to the audio.
+          One sentence per line, or separated by 。！？
+        </p>
+      </div>
       <fieldset class="engine" id="enginePicker">
         <legend>Transcribe on</legend>
         <label class="engine-opt">
@@ -33,6 +58,13 @@
           <span><b>This phone</b><small id="deviceNote">Private, works offline after the first download</small></span>
         </label>
         <div id="deviceModels" class="model-opts"></div>
+        <div id="gpuNotice" class="gpu-notice" hidden>
+          The GPU failed with this model on your phone, so it now runs on the CPU (slower).
+          <span class="gpu-actions">
+            <button type="button" id="gpuRetry" class="link-btn">Try GPU again</button>
+            <button type="button" id="gpuCopy" class="link-btn">Copy details</button>
+          </span>
+        </div>
         <label class="engine-opt">
           <input type="radio" name="engine" value="server" />
           <span><b>Computer</b><small id="serverNote">Checking…</small></span>
@@ -85,6 +117,7 @@
             <span>Furigana</span>
           </label>
           <button id="copyBtn" class="link-btn">Copy</button>
+          <button id="exportBtn" class="link-btn" title="Save as synced lyrics (.lrc)">Export</button>
         </div>
       </div>
       <ol id="transcript" class="transcript" lang="ja"></ol>
@@ -98,6 +131,10 @@
       <span id="curTime" class="time">0:00</span>
       <input id="seek" type="range" min="0" max="0" step="0.01" value="0" aria-label="Seek" />
       <span id="durTime" class="time">0:00</span>
+    </div>
+    <div id="gapRow" class="gap-row" hidden>
+      <span class="gap-label"><span>Pause <b id="gapNow"></b></span><small>× sentence length · at least 1 s</small></span>
+      <div id="gapOpts" class="gap-opts" role="radiogroup" aria-label="Pause between repeats"></div>
     </div>
     <div class="controls">
       <button id="rateBtn" class="rate-btn" aria-label="Playback speed" title="Playback speed">1×</button>

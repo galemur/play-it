@@ -296,3 +296,60 @@ html:has(body.has-player) { scroll-padding-bottom: calc(var(--player-h) + env(sa
 .model-opts[hidden] { display: none; }
 .model-opt { padding: 10px 12px; background: transparent; border: 1px solid #334155; }
 .model-opt:has(input:checked) { border-color: var(--accent); }
+
+.gpu-notice {
+  margin-left: 28px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(248, 113, 113, 0.1);
+  color: #fecaca;
+  font-size: .82rem;
+}
+.gpu-actions { display: flex; gap: 14px; margin-top: 4px; }
+
+/* Pause between repeats */
+.gap-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+  font-size: .8rem;
+  color: var(--text);
+}
+.gap-label { display: flex; flex-direction: column; line-height: 1.3; }
+.gap-label small { color: var(--muted); font-size: .72rem; }
+.gap-opts { display: flex; gap: 2px; padding: 3px; border-radius: 18px; background: var(--surface-2); flex: none; }
+.gap-opt { min-width: 44px; height: 30px; border-radius: 15px; font-size: .8rem; font-weight: 600; color: var(--muted); }
+.gap-opt[aria-checked="true"] { background: var(--accent); color: var(--accent-ink); }
+
+/* Bar that fills during the pause before the sentence repeats. */
+.seg { position: relative; }
+.seg.gap::after {
+  content: "";
+  position: absolute;
+  left: 14px; right: 14px; bottom: 5px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+  transform-origin: left;
+  animation: gap-fill var(--gap, 1s) linear forwards;
+}
+@keyframes gap-fill { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+
+/* Optional user transcript */
+.transcript-pick { display: flex; flex-direction: column; gap: 8px; }
+.pick-btn {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px;
+  border: 1px dashed #3b4b63;
+  border-radius: 12px;
+  text-align: left;
+}
+.pick-btn svg { width: 26px; height: 26px; fill: var(--accent); flex: none; }
+.pick-btn span { display: flex; flex-direction: column; gap: 2px; }
+.pick-btn small { color: var(--muted); font-size: .8rem; }
+.text-info { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.text-help { margin: 0; }
+.seg .ts.approx { font-style: italic; }
+.lrc-modes { display: flex; flex-direction: column; gap: 6px; }

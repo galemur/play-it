@@ -3,6 +3,7 @@
 import { pipeline, env } from '../vendor/transformers/transformers.min.js';
 import { splitAtSilence, rms, SAMPLE_RATE } from '../shared/chunking.js';
 import { tokensToRuby } from '../shared/ruby.js';
+import { alignTranscript, splitSentences, snapToSpeech } from '../shared/align.js';
 import { DEVICE_MODELS } from './models.js';
 
 // Below this level a chunk is treated as silence and skipped (Whisper hallucinates on silence).
@@ -19,22 +20,42 @@ const post = (msg) => self.postMessage(msg);
 
 let current = null; // { key, device, asr }
 
-async function hasWebGPU() {
+async function getAdapter() {
   try {
-    return !!(await navigator.gpu?.requestAdapter());
+    return await navigator.gpu?.requestAdapter();
   } catch {
-    return false;
+    return null;
   }
 }
 
-async function loadModel(key) {
-  if (current?.key === key) return current;
+/** GPU details sent along with a WebGPU failure, to help diagnose driver-specific bugs. */
+async function gpuInfo() {
+  const a = await getAdapter();
+  if (!a) return null;
+  const { vendor, architecture, device, description } = a.info ?? {};
+  const l = a.limits;
+  return {
+    vendor, architecture, device, description,
+    features: ['shader-f16', 'subgroups'].filter((f) => a.features.has(f)),
+    maxComputeWorkgroupStorageSize: l.maxComputeWorkgroupStorageSize,
+    maxComputeInvocationsPerWorkgroup: l.maxComputeInvocationsPerWorkgroup,
+    maxStorageBufferBindingSize: l.maxStorageBufferBindingSize,
+    maxBufferSize: l.maxBufferSize,
+  };
+}
+
+async function loadModel(key, allowGPU) {
+  const model = DEVICE_MODELS[key];
+  const device = allowGPU && model.preferWebGPU && (await getAdapter()) ? 'webgpu' : 'wasm';
+  if (current?.key === key && current.device === device) return current;
   if (current) {
-    await current.asr.dispose?.();
+    try {
+      await current.asr.dispose?.();
+    } catch {
+      /* a failed GPU session may not dispose cleanly; it's dropped either way */
+    }
     current = null;
   }
-  const model = DEVICE_MODELS[key];
-  const device = model.preferWebGPU && (await hasWebGPU()) ? 'webgpu' : 'wasm';
   const files = new Map();
   const asr = await pipeline('automatic-speech-recognition', model.id, {
     device,
@@ -49,6 +70,8 @@ async function loadModel(key) {
       }
       post({ type: 'update', phase: 'loading-model', progress: total ? loaded / total : 0, device });
     },
+  }).catch((e) => {
+    throw Object.assign(e instanceof Error ? e : new Error(String(e)), { device });
   });
   current = { key, device, asr };
   return current;
@@ -70,25 +93,72 @@ function loadTokenizer() {
   return tokenizerPromise;
 }
 
-async function transcribe(audio, key) {
+/**
+ * Time the user's own transcript using Whisper's segments, then tighten each sentence to
+ * where speech actually starts/ends in the audio. Returns furigana-ready segments.
+ */
+async function alignToTranscript(asrSegments, transcript, audio, duration) {
+  const sentences = splitSentences(transcript);
+  if (!sentences.length) throw new Error('The transcript file has no sentences.');
+  const tokenizer = await loadTokenizer();
+  const tokenize = (t) => tokenizer.tokenize(t);
+  const { segments, matched } = alignTranscript(asrSegments, sentences, tokenize, duration);
+  const timed = audio ? snapToSpeech(segments, audio, SAMPLE_RATE) : segments;
+  for (const seg of timed) seg.ruby = tokensToRuby(tokenize(seg.text));
+  // Keep Whisper's own segments so the transcript can be re-aligned later without re-transcribing.
+  const asr = asrSegments.map(({ start, end, text }) => ({ start, end, text }));
+  return { segments: timed, asr, aligned: true, matched, duration, text: sentences.join('\n') };
+}
+
+async function transcribe(audio, key, { allowGPU = true, simulateGpuError = false, transcript = null } = {}) {
   const duration = audio.length / SAMPLE_RATE;
-  post({ type: 'update', phase: 'loading-model', progress: 0 });
-  const [{ asr, device }, tokenizer] = await Promise.all([loadModel(key), loadTokenizer()]);
+  let notice = '';
+  const update = (u) => post({ type: 'update', duration, notice, ...u });
+
+  // Some phone GPU drivers fail on specific ONNX Runtime WebGPU kernels (e.g. a 4-bit MatMul
+  // shader that doesn't compile). Then switch to the CPU with the same, already cached model.
+  const fallBackToCPU = async (e) => {
+    post({ type: 'gpu-failed', model: key, message: e?.message || String(e), gpu: await gpuInfo() });
+    notice = 'The GPU failed on this phone, continuing on the CPU (slower)';
+    update({ phase: 'loading-model', progress: 1, device: 'wasm' });
+    return loadModel(key, false);
+  };
+
+  update({ phase: 'loading-model', progress: 0 });
+  const tokenizerP = loadTokenizer();
+  let state;
+  try {
+    state = await loadModel(key, allowGPU);
+  } catch (e) {
+    if (e.device !== 'webgpu') throw e;
+    state = await fallBackToCPU(e);
+  }
+  const tokenizer = await tokenizerP;
+
+  const run = async (chunk) => {
+    if (simulateGpuError && state.device === 'webgpu') throw new Error('Simulated WebGPU failure');
+    return state.asr(chunk, { language: 'japanese', task: 'transcribe', return_timestamps: true });
+  };
 
   const chunks = splitAtSilence(audio);
   const segments = [];
   for (let i = 0; i < chunks.length; i++) {
-    post({ type: 'update', phase: 'transcribing', progress: i / chunks.length, segments, duration, device });
+    update({ phase: 'transcribing', progress: i / chunks.length, segments, device: state.device });
     const { start, end } = chunks[i];
     if (rms(audio, start, end) < SILENCE_RMS) continue;
 
     const offset = start / SAMPLE_RATE;
     const chunkDur = (end - start) / SAMPLE_RATE;
-    const out = await asr(audio.subarray(start, end), {
-      language: 'japanese',
-      task: 'transcribe',
-      return_timestamps: true,
-    });
+    const chunk = audio.subarray(start, end);
+    let out;
+    try {
+      out = await run(chunk);
+    } catch (e) {
+      if (state.device !== 'webgpu') throw e;
+      state = await fallBackToCPU(e);
+      update({ phase: 'transcribing', progress: i / chunks.length, segments, device: state.device });
+      out = await run(chunk);
+    }
     for (const c of out.chunks ?? [{ timestamp: [0, chunkDur], text: out.text }]) {
       const text = c.text.trim();
       if (!text) continue;
@@ -101,15 +171,28 @@ async function transcribe(audio, key) {
     }
   }
 
-  post({ type: 'update', phase: 'furigana', progress: 1, segments, duration, device });
+  if (transcript) {
+    update({ phase: 'aligning', progress: 1, segments, device: state.device });
+    return { ...(await alignToTranscript(segments, transcript, audio, duration)), device: state.device };
+  }
+
+  update({ phase: 'furigana', progress: 1, segments, device: state.device });
   for (const seg of segments) seg.ruby = tokensToRuby(tokenizer.tokenize(seg.text));
-  return { segments, duration, text: segments.map((s) => s.text).join(''), device };
+  return { segments, duration, text: segments.map((s) => s.text).join(''), device: state.device };
 }
 
 self.onmessage = async ({ data }) => {
-  if (data.type !== 'transcribe') return;
   try {
-    post({ type: 'done', result: await transcribe(data.audio, data.model) });
+    if (data.type === 'transcribe') post({ type: 'done', result: await transcribe(data.audio, data.model, data.options) });
+    else if (data.type === 'furigana') {
+      // Timed lines from an imported .lrc file: only the furigana are needed.
+      const tokenizer = await loadTokenizer();
+      for (const seg of data.segments) seg.ruby = tokensToRuby(tokenizer.tokenize(seg.text));
+      post({ type: 'done', result: { segments: data.segments } });
+    } else if (data.type === 'align') {
+      post({ type: 'update', phase: 'aligning', progress: null });
+      post({ type: 'done', result: await alignToTranscript(data.asr, data.transcript, data.audio, data.duration) });
+    }
   } catch (e) {
     post({ type: 'error', message: e?.message || String(e) });
   }

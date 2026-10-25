@@ -1,4 +1,6 @@
-import { DEVICE_MODELS, modelTag, deviceUnsupportedReason, hasWebGPU, transcribeOnDevice, decodeFile, encodeWav } from './device/engine.js';
+import { DEVICE_MODELS, modelTag, deviceUnsupportedReason, hasWebGPU, transcribeOnDevice, alignOnDevice, furiganaOnDevice, decodeFile, encodeWav, getGpuFailure, clearGpuFailure } from './device/engine.js';
+import { splitSentences } from './shared/align.js';
+import { parseLrc, lrcToSegments, buildLrc, isTimedLrc } from './shared/lrc.js';
 import { readMetadata } from './metadata.js';
 import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './history.js';
 
@@ -20,6 +22,12 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
   const furiSwitch = $('furiSwitch');
   const textToggle = $('textToggle');
   const hint = $('hint');
+  const textPickBtn = $('textPickBtn');
+  const textInput = $('textInput');
+  const textInfo = $('textInfo');
+  const textHelp = $('textHelp');
+  const lrcModes = $('lrcModes');
+  const exportBtn = $('exportBtn');
   const transcriptEl = $('transcript');
   const cover = $('cover');
   const trackTitle = $('trackTitle');
@@ -36,6 +44,9 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
   const prevBtn = $('prevBtn');
   const nextBtn = $('nextBtn');
   const repeatBtn = $('repeatBtn');
+  const gapRow = $('gapRow');
+  const gapOpts = $('gapOpts');
+  const gapNow = $('gapNow');
   const rateBtn = $('rateBtn');
   const curTime = $('curTime');
   const durTime = $('durTime');
@@ -48,6 +59,7 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
   const deviceModelsEl = $('deviceModels');
   const deviceNote = $('deviceNote');
   const serverNote = $('serverNote');
+  const gpuNotice = $('gpuNotice');
 
   const RATES = [0.75, 1, 1.25, 1.5];
   // v2: transcripts now include furigana, so older cached entries are ignored.
@@ -65,6 +77,8 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
   let segEls = [];
   let activeIdx = -1;
   let loopIdx = -1; // index of the sentence being repeated, or -1 when repeat is off
+  let gapTimer = null; // pending replay while pausing between repeats
+  let gapCountdown = null; // interval updating the "next in …" readout during the pause
   let userScrolledAt = 0;
   let seeking = false;
   let server = null; // { model, maxUploadBytes } when a Play It server is reachable
@@ -98,8 +112,12 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
     (value === 'device' ? deviceNote : serverNote).textContent = note;
   };
 
+  // Diagnostic switch: ?simulate-gpu-error makes the first GPU run fail, to test the CPU fallback.
+  const simulateGpuError = new URLSearchParams(location.search).has('simulate-gpu-error');
+
   const updateEngineUI = () => {
     deviceModelsEl.hidden = engine() !== 'device';
+    gpuNotice.hidden = engine() !== 'device' || !getGpuFailure(deviceModel());
     if (engine()) dzSub.textContent = `MP3 · WAV · M4A · OGG · FLAC… · up to ${Math.round(maxBytes() / 1024 / 1024)} MB`;
     if (selectedFile) selectFile(selectedFile); // re-check the size limit for the new engine
   };
@@ -192,7 +210,7 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
     selectedFile = f;
     fileInfo.textContent = `${f.name} (${fmtSize(f.size)})`;
     fileInfo.hidden = false;
-    transcribeBtn.disabled = !engine();
+    updateTranscribeLabel();
   };
 
   fileInput.addEventListener('change', () => {
@@ -217,16 +235,141 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
   );
   dropzone.addEventListener('drop', (e) => selectFile(e.dataTransfer.files[0]));
 
+  // ---------- optional user transcript ----------
+  let userText = null; // the user's own transcript, timed against the audio instead of Whisper's text
+  let userLrc = null; // parsed .lrc file: its timings can be used directly, with no transcription
+  let userLrcRaw = '';
+  const lrcMode = () => document.querySelector('input[name="lrcMode"]:checked')?.value ?? 'file';
+
+  /** Japanese .txt files are often Shift_JIS or UTF-16 rather than UTF-8. */
+  const readTextFile = async (f) => {
+    const bytes = new Uint8Array(await f.arrayBuffer());
+    if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder('utf-16le').decode(bytes);
+    if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder('utf-16be').decode(bytes);
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch {
+      return new TextDecoder('shift_jis').decode(bytes);
+    }
+  };
+
+  // Opening an .lrc with its own timings transcribes nothing, so no engine is needed (or shown).
+  const usesLrcTimings = () => !!userLrc && lrcMode() === 'file';
+  const updateTranscribeLabel = () => {
+    transcribeBtn.textContent = usesLrcTimings() ? 'Open with these timings' : userText ? 'Transcribe & time my transcript' : 'Transcribe';
+    $('enginePicker').hidden = usesLrcTimings();
+    transcribeBtn.disabled = !selectedFile || (!engine() && !usesLrcTimings());
+  };
+
+  /** `lrc`: the parsed file when it's timed lyrics; `text` is then its lines, for re-timing. */
+  const setUserText = (text, name, lrc = null, raw = '') => {
+    userText = text;
+    userLrc = lrc;
+    userLrcRaw = raw;
+    textInfo.hidden = !text;
+    textPickBtn.hidden = !!text;
+    textHelp.hidden = !text || !!lrc;
+    lrcModes.hidden = !lrc;
+    if (lrc) $('textInfoText').textContent = `${name} · ${lrcToSegments(lrc).length} timed lines`;
+    else if (text) $('textInfoText').textContent = `${name} · ${splitSentences(text).length} sentences`;
+    updateTranscribeLabel();
+  };
+  for (const r of document.querySelectorAll('input[name="lrcMode"]')) r.addEventListener('change', updateTranscribeLabel);
+
+  textPickBtn.addEventListener('click', () => textInput.click());
+  textInput.addEventListener('change', async () => {
+    const f = textInput.files[0];
+    textInput.value = '';
+    if (!f) return;
+    showError('');
+    const text = await readTextFile(f).catch(() => null);
+    if (text && (/\.lrc$/i.test(f.name) || isTimedLrc(text))) {
+      const lrc = parseLrc(text);
+      const lines = lrc.lines.map((l) => l.text).filter(Boolean);
+      if (!lines.length) return showError(`"${f.name}" doesn't contain any lyrics lines.`);
+      // Untimed .lrc (no [mm:ss] tags) is just text: time it like a .txt transcript.
+      if (!lrc.lines.length) return setUserText(lines.join('\n'), f.name);
+      return setUserText(lines.join('\n'), f.name, lrc, text);
+    }
+    if (!text || !splitSentences(text).length) return showError(`"${f.name}" doesn't contain any sentences.`);
+    setUserText(text, f.name);
+  });
+  $('textRemove').addEventListener('click', () => setUserText(null));
+
+  // Short, stable fingerprint of a transcript, so each text gets its own history entry.
+  const hashText = (text) => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193);
+    return (h >>> 0).toString(36);
+  };
+
+  /**
+   * An earlier Whisper run of this audio: plain, or kept inside an aligned entry. Prefers the
+   * current model, but any model's run is fine for timing (e.g. transcribed on the computer).
+   */
+  const findWhisperResult = async (plainId, file) => {
+    // Imported .lrc entries carry the file's timings, not a transcription, so they never count.
+    const whisper = (e) =>
+      e?.data?.imported ? null
+      : e?.data?.aligned ? (e.data.asr?.length ? { segments: e.data.asr, duration: e.data.duration } : null)
+      : e?.data?.segments?.length ? e.data : null;
+    const exact = whisper(await getEntry(plainId).catch(() => null));
+    if (exact) return exact;
+    const all = await listHistory().catch(() => []);
+    const same = (e) => e.name === file.name && e.size === file.size;
+    return whisper(all.find((e) => e.plainId === plainId)) ?? all.filter(same).map(whisper).find(Boolean) ?? null;
+  };
+
+  /** Duration of an audio file from its metadata (no full decode). */
+  const audioDuration = (file) =>
+    new Promise((resolve) => {
+      const a = new Audio();
+      const url = URL.createObjectURL(file);
+      const done = (d) => {
+        URL.revokeObjectURL(url);
+        resolve(d);
+      };
+      a.onloadedmetadata = () => done(a.duration);
+      a.onerror = () => done(NaN);
+      setTimeout(() => done(NaN), 5000);
+      a.src = url;
+    });
+
+  /** Use an imported .lrc file's own timings: no transcription, just furigana. */
+  const openWithLrc = async (file, lrc, raw) => {
+    const id = `lrc:${file.name}:${file.size}:${file.lastModified}:${hashText(raw)}`;
+    const saved = await getEntry(id).catch(() => null);
+    if (saved && hasFurigana(saved.data)) return openEntry({ ...saved, audio: file }, !saved.audio);
+    show(loadingView);
+    preview.replaceChildren();
+    setProgress(PHASES.furigana, '', null);
+    try {
+      const duration = await audioDuration(file);
+      const segs = await furiganaOnDevice(lrcToSegments(lrc, duration), showJobProgress);
+      const data = { segments: segs, text: segs.map((x) => x.text).join('\n'), duration, imported: 'lrc' };
+      // The .lrc file's [ti:]/[ar:]/[al:] fill in for audio without its own tags.
+      const lrcMeta = { title: lrc.meta.ti, artist: lrc.meta.ar, album: lrc.meta.al };
+      await addToHistory(id, file, data, {}, lrcMeta);
+    } catch (e) {
+      show(uploadView);
+      showError(`Couldn't open the lyrics: ${e.message}`);
+    }
+  };
+
   // ---------- transcription ----------
   transcribeBtn.addEventListener('click', async () => {
-    if (!selectedFile || !engine()) return;
+    if (!selectedFile) return;
     const file = selectedFile;
+    if (usesLrcTimings()) return openWithLrc(file, userLrc, userLrcRaw);
+    if (!engine()) return;
+    const text = userText;
 
-    const id = entryId(file);
+    const plainId = entryId(file);
+    const id = text ? `${plainId}:text:${hashText(text)}` : plainId;
     const saved = await getEntry(id).catch(() => null);
     if (saved && hasFurigana(saved.data)) return openEntry({ ...saved, audio: file }, !saved.audio);
 
-    const cached = localStorage.getItem(legacyKey(file));
+    const cached = !text && localStorage.getItem(legacyKey(file));
     if (cached) {
       localStorage.removeItem(legacyKey(file));
       try {
@@ -237,26 +380,45 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
       }
     }
 
+    // With a transcript, an earlier Whisper run of the same audio makes timing it instant.
+    const earlier = text ? await findWhisperResult(plainId, file) : null;
+
     show(loadingView);
     const onDevice = engine() === 'device';
-    setProgress(onDevice ? 'Reading audio…' : 'Uploading…', '', null);
+    setProgress(earlier ? PHASES.aligning : onDevice ? 'Reading audio…' : 'Uploading…', '', null);
     preview.replaceChildren();
     // Phones throttle or suspend pages whose screen turns off, which would stall the job.
     const wakeLock = await navigator.wakeLock?.request('screen').catch(() => null);
     try {
-      const data = onDevice
-        ? await transcribeOnDevice(file, deviceModel(), showJobProgress)
-        : await uploadAndWait(file);
+      let data;
+      if (earlier) data = await alignOnDevice(file, earlier.segments, text, earlier.duration, showJobProgress);
+      else if (onDevice) data = await transcribeOnDevice(file, deviceModel(), showJobProgress, { simulateGpuError, transcript: text });
+      else {
+        data = await uploadAndWait(file);
+        // The server only transcribes; the timing of the user's text happens here in the browser.
+        if (text) data = await alignOnDevice(file, data.segments, text, data.duration, showJobProgress);
+      }
       // Don't keep results from a server without furigana support (e.g. one started
       // before an update), or that transcript would stay furigana-less.
-      if (hasFurigana(data)) await addToHistory(id, file, data);
+      if (hasFurigana(data)) await addToHistory(id, file, data, text ? { plainId } : {});
       else showResult(file, data, await readMetadata(file));
     } catch (e) {
       show(uploadView);
       showError(`Transcription failed: ${e.message}`);
     } finally {
       wakeLock?.release();
+      updateEngineUI(); // a GPU failure during this run shows up on the upload screen
     }
+  });
+
+  $('gpuRetry').addEventListener('click', () => {
+    clearGpuFailure(deviceModel());
+    updateEngineUI();
+  });
+  $('gpuCopy').addEventListener('click', async (e) => {
+    const details = { model: modelName(), userAgent: navigator.userAgent, ...getGpuFailure(deviceModel()) };
+    e.target.textContent = (await copyText(JSON.stringify(details, null, 2))) ? 'Copied' : 'Copy failed';
+    setTimeout(() => (e.target.textContent = 'Copy details'), 1500);
   });
 
   const PHASES = {
@@ -265,6 +427,7 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
     'loading-model': 'Preparing speech recognition model…',
     transcribing: 'Transcribing…',
     furigana: 'Adding furigana…',
+    aligning: 'Timing your transcript to the audio…',
   };
 
   const setProgress = (title, sub, ratio) => {
@@ -338,6 +501,7 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
       const done = job.segments?.at(-1)?.end ?? 0;
       sub = job.duration ? `${fmt(done)} / ${fmt(job.duration)}${where}` : '';
     }
+    if (job.notice) sub = sub ? `${job.notice} · ${sub}` : job.notice;
     setProgress(PHASES[phase] || 'Processing…', sub, ratio);
     if (job.segments) renderPreview(job.segments);
   };
@@ -362,9 +526,11 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
   };
 
   // ---------- history of transcribed files ----------
-  const addToHistory = async (id, file, data) => {
+  const addToHistory = async (id, file, data, extra = {}, fallbackMeta = null) => {
     const { segments: segs, text, duration } = data;
-    const meta = await readMetadata(file);
+    const fileMeta = await readMetadata(file);
+    const fallback = Object.fromEntries(Object.entries(fallbackMeta ?? {}).filter(([, v]) => v));
+    const meta = fileMeta || Object.keys(fallback).length ? { ...fallback, ...fileMeta } : null;
     const now = Date.now();
     const entry = {
       id,
@@ -372,10 +538,18 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
       size: file.size,
       model: modelName(),
       meta,
-      data: { segments: segs, text, duration },
+      // Aligned entries keep Whisper's own segments, so the text can be re-timed without re-transcribing.
+      data: {
+        segments: segs,
+        text,
+        duration,
+        ...(data.aligned && { aligned: true, asr: data.asr, matched: data.matched }),
+        ...(data.imported && { imported: data.imported }),
+      },
       audio: file,
       addedAt: now,
       playedAt: now,
+      ...extra,
     };
     await saveEntry(entry).catch((e) => console.warn('Could not save to history:', e));
     showResult(file, data, meta);
@@ -417,7 +591,7 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
         const title = document.createElement('b');
         title.textContent = e.meta?.title || e.name;
         const sub = document.createElement('small');
-        const parts = [e.meta?.artist, fmt(entryDuration(e)), fmtDate(e.playedAt)];
+        const parts = [e.meta?.artist, fmt(entryDuration(e)), e.data.aligned && 'your transcript', e.data.imported === 'lrc' && 'from .lrc', fmtDate(e.playedAt)];
         if (!e.audio) parts.push('tap to choose the file');
         sub.textContent = parts.filter(Boolean).join(' · ');
         text.append(title, sub);
@@ -478,7 +652,17 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
     }
   };
 
+  const DEFAULT_HINT = hint.textContent;
+  let current = null; // the file being played, for exporting its transcript
+
   const showResult = (file, data, meta) => {
+    const approx = data.aligned ? (data.segments ?? []).filter((s) => s.approx).length : 0;
+    hint.textContent = data.aligned
+      ? `Your transcript, timed to the audio${approx ? ` · ${approx} approximate (≈)` : ''}. Tap a sentence to play it.`
+      : data.imported === 'lrc'
+        ? 'Timings from your .lrc file. Tap a sentence to play it.'
+        : DEFAULT_HINT;
+    current = { file, meta, duration: data.duration };
     segments = data.segments?.length
       ? data.segments
       : [{ start: 0, end: data.duration || Infinity, text: data.text || '' }];
@@ -489,8 +673,10 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
       li.className = 'seg';
       li.dataset.idx = i;
       const ts = document.createElement('span');
-      ts.className = 'ts';
-      ts.textContent = fmt(s.start);
+      ts.className = s.approx ? 'ts approx' : 'ts';
+      // ≈: the sentence couldn't be matched to the speech well, so its time is estimated.
+      ts.textContent = (s.approx ? '≈' : '') + fmt(s.start);
+      if (s.approx) ts.title = 'Approximate: this sentence could not be matched well to the audio';
       const tx = document.createElement('span');
       tx.className = 'tx';
       renderSentence(tx, s);
@@ -565,6 +751,7 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
   // ---------- seeking & sentence navigation ----------
   /** All user-initiated seeks go through here so repeat mode follows the new position. */
   const seekTo = (t) => {
+    cancelGap();
     audio.currentTime = Math.max(0, Math.min(t, audio.duration || t));
     userScrolledAt = 0;
     if (loopIdx >= 0) setLoopIdx(Math.max(0, findSegment(audio.currentTime)));
@@ -588,10 +775,95 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
     if (segEls[loopIdx]) segEls[loopIdx].classList.remove('repeating');
     loopIdx = i;
     if (segEls[loopIdx]) segEls[loopIdx].classList.add('repeating');
+    updateGapNow();
+  };
+
+  // ---------- pause between repeats ----------
+  // The pause scales with the sentence (time to say it back), but never drops below 1 s.
+  const GAP_FACTORS = [0.5, 1, 1.5, 2];
+  // Fractions rather than "0.5×" so this doesn't read like the playback-speed button.
+  const GAP_LABELS = { 0.5: '½', 1: '1', 1.5: '1½', 2: '2' };
+  const GAP_PREF = 'playit:repeat-gap';
+  const MIN_GAP_SEC = 1;
+  let gapFactor = GAP_FACTORS.includes(+localStorage.getItem(GAP_PREF)) ? +localStorage.getItem(GAP_PREF) : 1;
+
+  const renderGapOpts = () => {
+    gapOpts.replaceChildren(
+      ...GAP_FACTORS.map((f) => {
+        const b = document.createElement('button');
+        b.className = 'gap-opt';
+        b.setAttribute('role', 'radio');
+        b.setAttribute('aria-checked', String(f === gapFactor));
+        b.textContent = GAP_LABELS[f];
+        b.setAttribute('aria-label', `${GAP_LABELS[f]} × sentence length`);
+        b.addEventListener('click', () => {
+          gapFactor = f;
+          localStorage.setItem(GAP_PREF, String(f));
+          renderGapOpts();
+        });
+        return b;
+      })
+    );
+    updateGapNow();
+  };
+
+  /** Pause before the repeated sentence plays again, in seconds. */
+  const gapSeconds = () => {
+    if (loopIdx < 0 || !segments[loopIdx]) return MIN_GAP_SEC;
+    // Based on how long the sentence actually takes to hear, so slower playback pauses longer.
+    const heard = (loopEnd(loopIdx) - segments[loopIdx].start) / audio.playbackRate;
+    return Math.max(MIN_GAP_SEC, heard * gapFactor);
+  };
+  const updateGapNow = () => (gapNow.textContent = loopIdx >= 0 ? `${gapSeconds().toFixed(1)} s` : '');
+  renderGapOpts();
+
+  // The player grows while the pause row is shown; keep the transcript clear of it.
+  new ResizeObserver(() => document.documentElement.style.setProperty('--player-h', `${player.offsetHeight}px`)).observe(player);
+
+  const inGap = () => gapTimer !== null;
+
+  const cancelGap = () => {
+    if (!inGap()) return;
+    clearTimeout(gapTimer);
+    gapTimer = null;
+    clearInterval(gapCountdown);
+    updateGapNow();
+    for (const el of transcriptEl.querySelectorAll('.seg.gap')) el.classList.remove('gap');
+    syncPlayIcon();
+  };
+
+  /** End of one repeat: rewind, wait a pause proportional to the sentence, then replay. */
+  const startGap = () => {
+    const seg = segments[loopIdx];
+    audio.pause();
+    audio.currentTime = seg.start + 0.01;
+    const gap = gapSeconds();
+    const el = segEls[loopIdx];
+    if (el) {
+      el.style.setProperty('--gap', `${gap}s`);
+      el.classList.remove('gap');
+      void el.offsetWidth; // restart the fill animation
+      el.classList.add('gap');
+    }
+    // Count down in the pause row too: it stays visible when the transcript text is hidden.
+    const until = Date.now() + gap * 1000;
+    const tickDown = () => (gapNow.textContent = `next in ${Math.max(0, (until - Date.now()) / 1000).toFixed(1)} s`);
+    tickDown();
+    gapCountdown = setInterval(tickDown, 100);
+    gapTimer = setTimeout(() => {
+      gapTimer = null;
+      clearInterval(gapCountdown);
+      updateGapNow();
+      el?.classList.remove('gap');
+      audio.play();
+    }, gap * 1000);
+    syncPlayIcon();
   };
 
   const setRepeat = (on) => {
+    cancelGap();
     repeatBtn.setAttribute('aria-pressed', String(on));
+    gapRow.hidden = !on;
     if (!on) return setLoopIdx(-1);
     const i = Math.max(0, findSegment(audio.currentTime));
     setLoopIdx(i);
@@ -601,10 +873,9 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
   };
 
   const enforceLoop = () => {
-    if (loopIdx < 0 || !segments[loopIdx]) return;
-    if (audio.currentTime >= loopEnd(loopIdx) || audio.currentTime < segments[loopIdx].start - 0.5) {
-      audio.currentTime = segments[loopIdx].start + 0.01;
-    }
+    if (loopIdx < 0 || !segments[loopIdx] || inGap()) return;
+    if (audio.currentTime >= loopEnd(loopIdx)) startGap();
+    else if (audio.currentTime < segments[loopIdx].start - 0.5) audio.currentTime = segments[loopIdx].start + 0.01;
   };
 
   transcriptEl.addEventListener('click', (e) => {
@@ -633,7 +904,8 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
 
   // ---------- player ----------
   const syncPlayIcon = () => {
-    const playing = !audio.paused;
+    // During the pause between repeats the audio element is paused, but playback is still "on".
+    const playing = !audio.paused || inGap();
     // SVG elements have no .hidden property, so toggle the attribute directly.
     playIcon.toggleAttribute('hidden', playing);
     pauseIcon.toggleAttribute('hidden', !playing);
@@ -654,10 +926,7 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
   audio.addEventListener('pause', syncPlayIcon);
   audio.addEventListener('ended', () => {
     // The last sentence's loop end can be past the end of the file.
-    if (loopIdx >= 0) {
-      audio.currentTime = segments[loopIdx].start + 0.01;
-      audio.play();
-    }
+    if (loopIdx >= 0 && !inGap()) startGap();
     syncPlayIcon();
   });
 
@@ -671,7 +940,11 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
   };
   audio.addEventListener('play', () => requestAnimationFrame(tick));
 
-  const togglePlay = () => (audio.paused ? audio.play() : audio.pause());
+  const togglePlay = () => {
+    if (inGap()) cancelGap(); // pausing during the pause between repeats stops the repeat cycle here
+    else if (audio.paused) audio.play();
+    else audio.pause();
+  };
   playBtn.addEventListener('click', togglePlay);
   prevBtn.addEventListener('click', prevSentence);
   nextBtn.addEventListener('click', nextSentence);
@@ -680,6 +953,7 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
     const next = RATES[(RATES.indexOf(audio.playbackRate) + 1) % RATES.length] ?? 1;
     audio.playbackRate = next;
     rateBtn.textContent = `${next}×`;
+    updateGapNow();
   });
 
   seek.addEventListener('input', () => {
@@ -711,6 +985,7 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
   // ---------- reset / copy ----------
   newBtn.addEventListener('click', () => {
     audio.pause();
+    setUserText(null); // a transcript belongs to one recording
     setRepeat(false);
     player.hidden = true;
     newBtn.hidden = true;
@@ -724,27 +999,63 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
     renderRecent();
   });
 
-  copyBtn.addEventListener('click', async () => {
-    const text = segments.map((s) => s.text).join('\n');
+  /** Copy text to the clipboard; returns whether it worked. */
+  const copyText = async (text) => {
     try {
       if (navigator.clipboard && window.isSecureContext) {
         await navigator.clipboard.writeText(text);
-      } else {
-        // Plain http over the LAN (e.g. from a phone) has no Clipboard API.
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        document.body.append(ta);
-        ta.select();
-        const ok = document.execCommand('copy');
-        ta.remove();
-        if (!ok) throw new Error('copy failed');
+        return true;
       }
-      copyBtn.textContent = 'Copied';
+      // Plain http over the LAN (e.g. from a phone) has no Clipboard API.
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.append(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
     } catch {
-      copyBtn.textContent = 'Copy failed';
+      return false;
     }
+  };
+
+  // ---------- export as .lrc (synced lyrics) ----------
+  exportBtn.addEventListener('click', async () => {
+    if (!current || !segments.length) return;
+    const base = current.file.name.replace(/\.[^.]+$/, '');
+    const lrc = buildLrc(segments, {
+      title: current.meta?.title || base,
+      artist: current.meta?.artist,
+      album: current.meta?.album,
+      duration: Number.isFinite(audio.duration) ? audio.duration : current.duration,
+    });
+    // Same base name as the audio, so music players pick the lyrics up automatically.
+    const file = new File([lrc], `${base}.lrc`, { type: 'text/plain' });
+    try {
+      if (navigator.canShare?.({ files: [file] })) {
+        // On phones this opens the share sheet: save to Files, or send to a music app.
+        await navigator.share({ files: [file], title: file.name });
+        return;
+      }
+    } catch (e) {
+      if (e.name === 'AbortError') return; // the user closed the share sheet
+    }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(file);
+    a.download = file.name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+    exportBtn.textContent = 'Saved';
+    setTimeout(() => (exportBtn.textContent = 'Export'), 1500);
+  });
+
+  copyBtn.addEventListener('click', async () => {
+    const ok = await copyText(segments.map((s) => s.text).join('\n'));
+    copyBtn.textContent = ok ? 'Copied' : 'Copy failed';
     setTimeout(() => (copyBtn.textContent = 'Copy'), 1500);
   });
 
