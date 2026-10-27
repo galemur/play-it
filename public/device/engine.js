@@ -8,15 +8,30 @@ export { DEVICE_MODELS, modelTag } from './models.js';
 const GPU_FAIL_PREFIX = 'playit:gpu-failed:';
 const browserVersion = () => navigator.userAgent.match(/Chrome\/([\d.]+)/)?.[1] ?? navigator.userAgent;
 
-/** Details of a GPU failure for this model on this browser version, or null. */
-export function getGpuFailure(modelKey) {
+// Set when the GPU failed only with subgroups (e.g. Adreno): start in compatibility mode.
+const GPU_COMPAT_PREFIX = 'playit:gpu-compat:';
+
+const readRecord = (key) => {
   try {
-    const f = JSON.parse(localStorage.getItem(GPU_FAIL_PREFIX + modelKey));
+    const f = JSON.parse(localStorage.getItem(key));
     return f?.browser === browserVersion() ? f : null;
   } catch {
     return null;
   }
+};
+
+/**
+ * Details of a GPU failure for this model on this browser version, or null. Only failures of
+ * the compatibility mode count: older records (before compatibility mode existed) are ignored,
+ * so those phones retry the GPU.
+ */
+export function getGpuFailure(modelKey) {
+  const f = readRecord(GPU_FAIL_PREFIX + modelKey);
+  return f?.mode === 'webgpu-compat' ? f : null;
 }
+
+/** Whether this model needs the GPU compatibility mode (no subgroups) on this browser. */
+const needsGpuCompat = (modelKey) => !!readRecord(GPU_COMPAT_PREFIX + modelKey);
 
 export function clearGpuFailure(modelKey) {
   localStorage.removeItem(GPU_FAIL_PREFIX + modelKey);
@@ -106,11 +121,9 @@ async function runJob(message, transfer, onUpdate) {
       worker.onmessage = ({ data }) => {
         if (data.type === 'update') onUpdate(data);
         else if (data.type === 'gpu-failed') {
-          console.warn('WebGPU failed, falling back to CPU:', data.message, data.gpu);
-          localStorage.setItem(
-            GPU_FAIL_PREFIX + data.model,
-            JSON.stringify({ browser: browserVersion(), message: data.message, gpu: data.gpu, at: new Date().toISOString() })
-          );
+          console.warn(`WebGPU (${data.mode}) failed:`, data.message, data.gpu);
+          const record = JSON.stringify({ browser: browserVersion(), mode: data.mode, message: data.message, gpu: data.gpu, at: new Date().toISOString() });
+          localStorage.setItem((data.mode === 'webgpu' ? GPU_COMPAT_PREFIX : GPU_FAIL_PREFIX) + data.model, record);
         } else if (data.type === 'done') resolve(data.result);
         else if (data.type === 'error') reject(new Error(data.message));
       };
@@ -132,10 +145,10 @@ async function runJob(message, transfer, onUpdate) {
  * that text timed against the audio instead of Whisper's wording.
  * @param {(update: object) => void} onUpdate receives job-like {phase, progress, segments, duration}
  */
-export async function transcribeOnDevice(file, modelKey, onUpdate, { simulateGpuError = false, transcript = null } = {}) {
+export async function transcribeOnDevice(file, modelKey, onUpdate, { simulateGpuError = '', transcript = null } = {}) {
   onUpdate({ phase: 'decoding' });
   const audio = await decodeFile(file);
-  const options = { allowGPU: !getGpuFailure(modelKey), simulateGpuError, transcript };
+  const options = { allowGPU: !getGpuFailure(modelKey), gpuCompat: needsGpuCompat(modelKey), simulateGpuError, transcript };
   return runJob({ type: 'transcribe', audio, model: modelKey, options }, [audio.buffer], onUpdate);
 }
 
