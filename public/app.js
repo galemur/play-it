@@ -112,8 +112,11 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
     (value === 'device' ? deviceNote : serverNote).textContent = note;
   };
 
-  // Diagnostic switch: ?simulate-gpu-error makes the first GPU run fail, to test the CPU fallback.
-  const simulateGpuError = new URLSearchParams(location.search).has('simulate-gpu-error');
+  // Diagnostic switch: ?simulate-gpu-error fails the GPU with subgroups (as on Adreno), to test
+  // the compatibility-mode retry;
+  // ?simulate-gpu-error=all also fails the GPU compatibility mode, to test the CPU fallback.
+  const simulateParam = new URLSearchParams(location.search).get('simulate-gpu-error');
+  const simulateGpuError = simulateParam === null ? '' : simulateParam || 'subgroups';
 
   const updateEngineUI = () => {
     deviceModelsEl.hidden = engine() !== 'device';
