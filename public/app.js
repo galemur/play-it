@@ -61,7 +61,7 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
   const serverNote = $('serverNote');
   const gpuNotice = $('gpuNotice');
 
-  const RATES = [0.75, 1, 1.25, 1.5];
+  const RATES = [0.75, 0.8, 0.85, 0.9, 1, 1.25, 1.5];
   // v2: transcripts now include furigana, so older cached entries are ignored.
   const CACHE_PREFIX = 'playit:v2:';
   const FURIGANA_PREF = 'playit:furigana';
@@ -552,6 +552,7 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
       audio: file,
       addedAt: now,
       playedAt: now,
+      metaVersion: META_VERSION,
       ...extra,
     };
     await saveEntry(entry).catch((e) => console.warn('Could not save to history:', e));
@@ -569,8 +570,25 @@ import { listHistory, getEntry, saveEntry, deleteEntry, touchEntry } from './his
   const entryDuration = (e) => e.data.duration || e.data.segments?.at(-1)?.end || 0;
   const fmtDate = (t) => new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 
+  // Bump when tag reading improves, so saved entries get their title/artist re-read once
+  // (v2: legacy-encoded tags such as Big5 used to show up garbled).
+  const META_VERSION = 2;
+  const refreshSavedMetadata = async (entries) => {
+    let changed = false;
+    for (const e of entries) {
+      if (!e.audio || e.metaVersion >= META_VERSION) continue;
+      const fresh = await readMetadata(e.audio);
+      // Keep fields that didn't come from the file (e.g. an imported .lrc's [ti:]).
+      const meta = fresh ? { ...e.meta, ...fresh } : e.meta;
+      changed ||= JSON.stringify(meta) !== JSON.stringify(e.meta);
+      await touchEntry(e.id, { meta, metaVersion: META_VERSION }).catch(() => {});
+    }
+    return changed;
+  };
+
   const renderRecent = async () => {
     recentEntries = await listHistory().catch(() => []);
+    if (await refreshSavedMetadata(recentEntries).catch(() => false)) recentEntries = await listHistory().catch(() => []);
     recentUrls.forEach(URL.revokeObjectURL);
     recentUrls = [];
     recentList.replaceChildren(
